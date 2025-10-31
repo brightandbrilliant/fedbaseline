@@ -10,7 +10,7 @@ import numpy as np
 class Client:
     def __init__(self, client_id, data: Data, encoder: nn.Module, classifier: nn.Module,
                  device='cpu', lr=0.005, weight_decay=1e-4,
-                 lambda_proto=1.0, num_classes=None):  # <-- 关键修改 1: 添加 FedProto 参数
+                 lambda_proto=1.0, num_classes=None, prototype_dim=64):  # <--- 【修改点】新增 prototype_dim
         """
         FedProto 客户端初始化，用于节点分类任务。
 
@@ -22,6 +22,7 @@ class Client:
             device (str): 运行设备。
             lambda_proto (float): FedProto 的原型正则化权重。
             num_classes (int): 数据集总类别数。
+            prototype_dim (int): 编码器输出/原型维度。【新增】
         """
         self.client_id = client_id
         self.data = data.to(device)
@@ -34,13 +35,11 @@ class Client:
         self.lambda_proto = lambda_proto
         self.num_classes = num_classes
 
-        # 关键修改 2: 存储全局原型 (在 main.py 首次同步后才会有实际值)
-        # 初始化为 None 或零向量，具体取决于 num_classes
+        # 关键修改 2: 存储全局原型
         if num_classes is None:
             raise ValueError("num_classes 必须在 Client 初始化时提供给 FedProto。")
 
-        # 假设原型维度等于编码器输出维度
-        prototype_dim = self.encoder.output_dim
+        # 使用传入的 prototype_dim 初始化全局原型
         self.global_prototypes = torch.zeros(num_classes, prototype_dim).to(device)
 
         # 优化器：优化编码器和分类头的所有参数
@@ -66,10 +65,9 @@ class Client:
 
         # 1. 使用编码器获取所有节点的特征嵌入
         with torch.no_grad():
-            # z 已经是无梯度，不会影响后续训练
             z = self.encoder(self.data.x, self.data.edge_index)
 
-            # 2. 构造本地训练集的有效掩码（与 train 保持一致）
+            # 2. 构造本地训练集的有效掩码
         train_mask = self.data.train_mask
         valid_labels_mask = (self.data.y >= 0)
         final_train_mask = train_mask & valid_labels_mask
@@ -83,7 +81,6 @@ class Client:
 
         # 3. 遍历所有类别，计算原型
         for class_id in range(self.num_classes):
-            # 获取属于当前类别的节点嵌入
             class_mask = (train_labels == class_id)
             class_z = train_z[class_mask]
 
@@ -143,7 +140,6 @@ class Client:
         local_prototypes, _ = self.get_local_prototypes()
 
         # 5. 计算 FedProto 原型损失 (L_proto)
-        # 注意：此处使用的 local_prototypes 依赖于当前的 encoder 参数
         proto_term = self.calculate_proto_loss(local_prototypes)
 
         # 6. 最终损失 = L_CE + L_proto
@@ -155,9 +151,6 @@ class Client:
 
         return loss.item()
 
-    # ----------------------------------------------------
-    # 评估逻辑 (Evaluate) 保持不变
-    # ----------------------------------------------------
     def evaluate(self, use_test=False):
         """在本地验证集或测试集上评估模型性能，并跳过无效标签节点。"""
         self.encoder.eval()
@@ -186,6 +179,7 @@ class Client:
             true_labels_np = eval_labels.cpu().numpy()
             pred_labels_np = pred_labels.cpu().numpy()
 
+            # 导入 Scikit-learn 指标计算
             from sklearn.metrics import f1_score, recall_score, precision_score, accuracy_score
             acc = accuracy_score(true_labels_np, pred_labels_np)
             recall = recall_score(true_labels_np, pred_labels_np, average='weighted', zero_division=0)
@@ -194,9 +188,7 @@ class Client:
 
         return acc, recall, precision, f1
 
-    # ----------------------------------------------------
-    # 参数管理逻辑 (新增原型同步方法)
-    # ----------------------------------------------------
+    # --- 参数管理逻辑 ---
 
     def get_encoder_state(self):
         return self.encoder.state_dict()
@@ -205,7 +197,6 @@ class Client:
         return self.classifier.state_dict()
 
     def get_global_prototypes(self):
-        # 仅用于初始化，实际通信是 local prototypes
         return self.global_prototypes
 
     def set_encoder_state(self, state_dict):
@@ -216,6 +207,4 @@ class Client:
 
     def set_global_prototypes(self, prototypes):
         """设置全局原型，用于本地正则化"""
-        # 注意：这里接收的 prototypes 已经是聚合后的全局结果
         self.global_prototypes = prototypes.to(self.device)
-        

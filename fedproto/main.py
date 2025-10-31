@@ -21,10 +21,8 @@ def split_client_data_for_node_classification(data: Data, val_ratio=0.2, test_ra
     num_nodes = data.num_nodes
     num_labeled_nodes = num_nodes
 
-    # 随机化节点索引
     indices = torch.randperm(num_labeled_nodes)
 
-    # 计算划分大小
     num_test = int(test_ratio * num_labeled_nodes)
     num_val = int(val_ratio * num_labeled_nodes)
     num_train = num_labeled_nodes - num_test - num_val
@@ -32,12 +30,10 @@ def split_client_data_for_node_classification(data: Data, val_ratio=0.2, test_ra
     if num_train <= 0:
         raise ValueError("训练集大小为零或负数，请检查划分比例。")
 
-    # 分割索引
     test_indices = indices[:num_test]
     val_indices = indices[num_test:num_test + num_val]
     train_indices = indices[num_test + num_val:]
 
-    # 创建 Masks
     train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=data.x.device)
     val_mask = torch.zeros(num_nodes, dtype=torch.bool, device=data.x.device)
     test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=data.x.device)
@@ -57,15 +53,10 @@ def split_client_data_for_node_classification(data: Data, val_ratio=0.2, test_ra
 
 # --- 2. 客户端加载逻辑（适配 FedProto） ---
 def load_all_clients(pyg_data_paths, encoder_params, classifier_params, training_params, device, lambda_proto,
-                     num_classes):  # <-- 传入 lambda 和 num_classes
+                     num_classes, prototype_dim):  # <--- 【修改点】新增 prototype_dim
     clients = []
 
-    if num_classes is None:
-        initial_data = torch.load(pyg_data_paths[0])
-        num_classes = initial_data.y.max().item() + 1
-
     print(f"检测到类别总数 (Output Dim): {num_classes}")
-    prototype_dim = encoder_params['output_dim']
     print(f"原型维度 (Prototype Dim): {prototype_dim}")
 
     for client_id, path in enumerate(pyg_data_paths):
@@ -82,7 +73,7 @@ def load_all_clients(pyg_data_paths, encoder_params, classifier_params, training
         encoder = GraphSAGE(
             input_dim=encoder_params['input_dim'],
             hidden_dim=encoder_params['hidden_dim'],
-            output_dim=prototype_dim,  # 编码器输出维度即为原型维度
+            output_dim=prototype_dim,
             num_layers=encoder_params['num_layers'],
             dropout=encoder_params['dropout']
         )
@@ -96,7 +87,7 @@ def load_all_clients(pyg_data_paths, encoder_params, classifier_params, training
             dropout=classifier_params['dropout']
         )
 
-        # 关键修改：实例化 Client 时传入 FedProto 参数
+        # 【修改点】实例化 Client 时传入 prototype_dim
         client = Client(
             client_id=client_id,
             data=data,
@@ -105,15 +96,16 @@ def load_all_clients(pyg_data_paths, encoder_params, classifier_params, training
             device=device,
             lr=training_params['lr'],
             weight_decay=training_params['weight_decay'],
-            lambda_proto=lambda_proto,  # <-- 传入 FedProto 参数
-            num_classes=num_classes  # <-- 传入类别总数
+            lambda_proto=lambda_proto,
+            num_classes=num_classes,
+            prototype_dim=prototype_dim  # <--- 传入维度
         )
         clients.append(client)
 
     return clients, num_classes
 
 
-# --- 3. FedAvg 聚合逻辑（仅用于模型权重） ---
+# --- 3. FedAvg 聚合逻辑（用于模型权重） ---
 def average_state_dicts(state_dicts):
     """标准 FedAvg 权重平均"""
     avg_state = {}
@@ -134,6 +126,7 @@ def aggregate_prototypes(clients, num_classes, prototype_dim, device):
     global_counts = torch.zeros(num_classes).to(device)
 
     # 1. 收集所有客户端的本地原型和计数
+    # 注意：get_local_prototypes 在 client.py 中已实现，是在评估模式下进行的无梯度计算
     all_local_protos_and_counts = []
     for client in clients:
         # get_local_prototypes 返回 (dict: {class_id: proto}, list: [(class_id, count)])
@@ -155,7 +148,7 @@ def aggregate_prototypes(clients, num_classes, prototype_dim, device):
         count = global_counts[class_id]
         if count > 0:
             global_prototypes[class_id] /= count
-        # 否则，如果该类别在所有客户端都没有出现，原型保持为零（或使用上一次的全局原型，但这里简化为零）
+        # 否则，该类别没有样本，原型保持零向量
 
     return global_prototypes
 
@@ -202,15 +195,14 @@ if __name__ == "__main__":
         print(f"❌ 错误: 未找到任何 PyG 子图文件在 {data_dir}。请检查路径和文件后缀。")
         exit()
 
-    initial_x = torch.load(pyg_data_files[0]).x
-    if initial_x is None or initial_x.dim() == 0:
-        input_dim = 1
-        print("⚠️ 警告: 无法读取第一个文件的特征维度，设置为默认值 1。")
-    else:
-        input_dim = initial_x.shape[1]
+    # 读取第一个文件来确定输入维度和类别数
+    initial_data = torch.load(pyg_data_files[0])
+    initial_x = initial_data.x
+    initial_y = initial_data.y
 
-    initial_y = torch.load(pyg_data_files[0]).y
-    num_classes_calc = initial_y.max().item() + 1 if initial_y is not None and initial_y.numel() > 0 else 7  # 假设类别数
+    input_dim = initial_x.shape[1] if initial_x is not None and initial_x.dim() > 0 else 1
+    # 确保类别数计算基于有效的标签
+    num_classes_calc = initial_y.max().item() + 1 if initial_y is not None and initial_y.numel() > 0 and initial_y.max().item() >= 0 else 7
 
     # 关键修改 A: FedProto 参数
     LAMBDA_PROTO = 1.0  # <--- 设置原型损失正则化权重。
@@ -218,7 +210,7 @@ if __name__ == "__main__":
     encoder_params = {
         'input_dim': input_dim,
         'hidden_dim': 128,
-        'output_dim': 64,  # 原型维度
+        'output_dim': 64,  # 原型维度 (D_emb)
         'num_layers': 3,
         'dropout': 0.5
     }
@@ -238,19 +230,21 @@ if __name__ == "__main__":
     num_rounds = 600
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # 获取原型维度 (所有客户端共享)
+    prototype_dim = encoder_params['output_dim']
+
     # 2. 初始化客户端
+    # 【修改点】调用 load_all_clients 时传入 prototype_dim
     clients, num_classes = load_all_clients(
         pyg_data_files,
         encoder_params,
         classifier_params,
         training_params,
         device,
-        LAMBDA_PROTO,  # 传入 FedProto 参数
-        num_classes_calc
+        LAMBDA_PROTO,
+        num_classes_calc,
+        prototype_dim
     )
-
-    # 获取原型维度 (所有客户端的 encoder.output_dim 应该相同)
-    prototype_dim = encoder_params['output_dim']
 
     # 初始全局原型：全零向量
     global_prototypes = torch.zeros(num_classes, prototype_dim).to(device)
@@ -275,7 +269,7 @@ if __name__ == "__main__":
             for _ in range(training_params['local_epochs']):
                 loss = client.train()
 
-        # 4. FedProto 聚合：聚合模型权重 (FedAvg) + 聚合原型 (FedProto)
+        # 4. 聚合：模型权重 (FedAvg) + 原型 (FedProto)
 
         # 4a. 模型权重聚合 (FedAvg 方式)
         encoder_states = [copy.deepcopy(client.get_encoder_state()) for client in clients]
@@ -301,7 +295,7 @@ if __name__ == "__main__":
             best_f1 = avg_f1
             best_encoder_state = global_encoder_state
             best_classifier_state = global_classifier_state
-            best_prototypes = global_prototypes  # 保存最佳原型
+            best_prototypes = global_prototypes
             print("===> New best global model and prototypes saved.")
 
     print("\n================ Federated Training Finished ================\n")
@@ -310,7 +304,6 @@ if __name__ == "__main__":
     for client in clients:
         client.set_encoder_state(best_encoder_state)
         client.set_classifier_state(best_classifier_state)
-        # 最终模型评估时，也需要将最佳原型同步给客户端，以防其评估逻辑依赖于全局原型
         client.set_global_prototypes(best_prototypes)
 
     print("\n================ Final Evaluation on Test Set ================")
