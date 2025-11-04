@@ -242,10 +242,12 @@ if __name__ == "__main__":
 
     print("\n================ Federated Training Finished ================\n")
 
+    cnt = 0
     # 7. 最终模型评估
-    for i, client in clients:
+    for client in clients:
         client.set_encoder_state(best_encoder_state)
-        client.set_classifier_state(best_classifier_states[i])
+        client.set_classifier_state(best_classifier_states[cnt])
+        cnt += 1
 
     print("\n================ Final Evaluation on Test Set ================")
     evaluate_all_clients(clients, use_test=True)
